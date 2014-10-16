@@ -150,6 +150,10 @@ if test "x$ac_cv_berkdb4" = xno; then
   AC_MSG_ERROR([Berkley DB >= 4.2 not found.])
 fi
 
+AC_CHECK_LIB([z], [deflate],
+	[AC_SUBST([Z_LIBS], ["-lz"])
+	 AC_DEFINE([HAVE_LIBZ], 1, [if you have the zlib library])])
+
 AC_ARG_ENABLE(compat,
   AC_HELP_STRING([--disable-compat], [don't include isync compatibility wrapper [no]]),
   [ob_cv_enable_compat=$enableval])
