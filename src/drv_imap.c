@@ -101,6 +101,7 @@ typedef struct imap_store {
 	/* trash folder's existence is not confirmed yet */
 	enum { TrashUnknown, TrashChecking, TrashKnown } trashnc;
 	unsigned got_namespace:1;
+	int compressing:2;
 	char *delimiter; /* hierarchy delimiter */
 	list_t *ns_personal, *ns_other, *ns_shared; /* NAMESPACE info */
 	message_t **msgapp; /* FETCH results */
@@ -191,7 +192,8 @@ enum CAPABILITY {
 	UIDPLUS,
 	LITERALPLUS,
 	MOVE,
-	NAMESPACE
+	NAMESPACE,
+	COMPRESS_DEFLATE
 };
 
 static const char *cap_list[] = {
@@ -205,7 +207,8 @@ static const char *cap_list[] = {
 	"UIDPLUS",
 	"LITERAL+",
 	"MOVE",
-	"NAMESPACE"
+	"NAMESPACE",
+	"COMPRESS=DEFLATE"
 };
 
 #define RESP_OK       0
@@ -1470,6 +1473,10 @@ static void imap_open_store_authenticate2_p2( imap_store_t *, struct imap_cmd *,
 static void imap_open_store_namespace( imap_store_t * );
 static void imap_open_store_namespace_p2( imap_store_t *, struct imap_cmd *, int );
 static void imap_open_store_namespace2( imap_store_t * );
+#ifdef HAVE_LIBZ
+static void imap_open_store_compress( imap_store_t * );
+static void imap_open_store_compress_p2( imap_store_t *, struct imap_cmd *, int );
+#endif
 static void imap_open_store_finalize( imap_store_t * );
 #ifdef HAVE_LIBSSL
 static void imap_open_store_ssl_bail( imap_store_t * );
@@ -1520,6 +1527,9 @@ imap_open_store( store_conf_t *conf, const char *label,
 	set_bad_callback( &ctx->gen, (void (*)(void *))imap_open_store_bail, ctx );
 	ctx->in_progress_append = &ctx->in_progress;
 	ctx->pending_append = &ctx->pending;
+
+	/* Don't yet know whether we can compress or not */
+	ctx->compressing = -1;
 
 	socket_init( &ctx->conn, &srvc->sconf,
 	             (void (*)( void * ))imap_invoke_bad_callback,
@@ -2018,11 +2028,48 @@ imap_open_store_namespace2( imap_store_t *ctx )
 			ctx->prefix = nsp_1st_ns->val;
 		if (!ctx->delimiter)
 			ctx->delimiter = nfstrdup( nsp_1st_dl->val );
-		imap_open_store_finalize( ctx );
 	} else {
 		imap_open_store_bail( ctx );
+		return;
 	}
+
+	imap_open_store_finalize( ctx );
+
+#ifdef HAVE_LIBZ
+	if (CAP(COMPRESS_DEFLATE)) {
+		imap_open_store_compress( ctx );
+		return;
+	} else {
+		ctx->compressing = 0;
+	}
+#endif
+
+	imap_open_store_finalize( ctx );
 }
+
+#ifdef HAVE_LIBZ
+static void
+imap_open_store_compress( imap_store_t *ctx ) {
+	if (ctx->compressing == -1) {
+		imap_exec( ctx, 0, imap_open_store_compress_p2, "COMPRESS DEFLATE" );
+		return;
+	}
+
+	imap_open_store_finalize( ctx );
+}
+
+static void
+imap_open_store_compress_p2( imap_store_t *ctx, struct imap_cmd *cmd ATTR_UNUSED, int response ) {
+	if (response == RESP_NO) {
+		imap_open_store_bail( ctx );
+	} else if (response == RESP_OK) {
+		ctx->compressing = 1;
+		socket_start_deflate( &ctx->conn );
+	}
+
+	imap_open_store_finalize( ctx );
+}
+#endif
 
 static void
 imap_open_store_finalize( imap_store_t *ctx )
