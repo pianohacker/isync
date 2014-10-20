@@ -278,6 +278,53 @@ static void start_tls_p3( conn_t *conn, int ok )
 
 #endif /* HAVE_LIBSSL */
 
+#ifdef HAVE_LIBZ
+static voidpf _socket_zalloc( voidpf opaque ATTR_UNUSED, uInt items, uInt size )
+{
+	return nfmalloc( items * size );
+}
+
+static void _socket_zfree( voidpf opaque ATTR_UNUSED, voidpf address )
+{
+	free( address );
+}
+
+void socket_start_deflate( conn_t *conn )
+{
+	int result;
+
+	if (conn->in_z) return;
+
+	conn->in_z = nfcalloc( sizeof( *conn->in_z ) );
+	conn->in_z->zalloc = _socket_zalloc;
+	conn->in_z->zfree = _socket_zfree;
+	result = inflateInit2(
+		conn->in_z,
+		-8 /* Use raw deflate */
+	);
+
+	if (result != Z_OK) {
+		error( "IMAP error: Cannot start compression for server '%s': %s\n", conn->conf->host, conn->in_z->msg );
+	}
+
+	conn->out_z = nfcalloc( sizeof( *conn->out_z ) );
+	conn->out_z->zalloc = _socket_zalloc;
+	conn->out_z->zfree = _socket_zfree;
+	result = deflateInit2(
+		conn->out_z,
+		Z_DEFAULT_COMPRESSION, /* Compression level */
+		Z_DEFLATED, /* Only valid value */
+		-8, /* Use raw deflate */
+		8, /* Default memory usage */
+		Z_DEFAULT_STRATEGY /* Don't try to do anything fancy */
+	);
+
+	if (result != Z_OK) {
+		error( "IMAP error: Cannot start compression for server '%s': %s\n", conn->conf->host, conn->out_z->msg );
+	}
+}
+#endif /* HAVE_LIBZ */
+
 static void socket_fd_cb( int, void * );
 
 static void socket_connect_one( conn_t * );
@@ -572,8 +619,13 @@ socket_read_line( conn_t *b )
 	return s;
 }
 
+#ifdef HAVE_LIBZ
+static int
+do_write_inner( conn_t *sock, char *buf, int len )
+#else
 static int
 do_write( conn_t *sock, char *buf, int len )
+#endif
 {
 	int n;
 
@@ -596,6 +648,79 @@ do_write( conn_t *sock, char *buf, int len )
 	}
 	return n;
 }
+
+#ifdef HAVE_LIBZ
+static int
+do_write( conn_t *sock, char *buf, int len )
+{
+	int result, to_write;
+	int progress = 0;
+	int outlen;
+	unsigned char *outbuf;
+
+	if (sock->out_z == NULL)
+		return do_write_inner( sock, buf, len );
+
+	/* Make sure that we write out any leftover compression output before we try to output more */
+	if (sock->in_z_leftover_len) {
+		result = do_write_inner( sock, (char*) sock->in_z_leftover, sock->in_z_leftover_len );
+
+		if (result < 0) {
+			return result;
+		} else if (result < sock->in_z_leftover_len) {
+			sock->in_z_leftover_len -= result;
+			sock->in_z_leftover += result;
+
+			/*
+			 * Don't return the result of the write; that reflects the amount of _compressed_ output
+			 * that was successfully written, and only applies to the last write attempt anyway.
+			 */
+			return 0;
+		}
+	}
+
+	sock->out_z->next_in = (unsigned char*) buf;
+	sock->out_z->avail_in = len;
+
+	outbuf = NULL;
+	outlen = 32;
+
+	do {
+		/* Have to reassign next_out each time as outbuf may move during realloc */
+		outbuf = nfrealloc( outbuf, outlen );
+		sock->out_z->next_out = outbuf + progress;
+		sock->out_z->avail_out = outlen - progress;
+
+		if ( deflate( sock->out_z, Z_SYNC_FLUSH ) != Z_OK ) {
+			error( "Outbound compression error: %s: %s\n", sock->name, sock->out_z->msg );
+			socket_fail( sock );
+			return -1;
+		}
+
+		to_write = outlen - sock->out_z->avail_out;
+		progress = sock->out_z->next_out - outbuf;
+
+		outlen *= 2; /* For next pass */
+	} while (sock->out_z->avail_out == 0);
+
+	result = do_write_inner( sock, (char*) outbuf, to_write );
+
+	if ( result > 0 && result < to_write ) {
+		sock->in_z_leftover = outbuf + result;
+		sock->in_z_leftover_len = to_write - result;
+
+		return len;
+	}
+
+	free( outbuf );
+
+	if ( result < 0 ) {
+		return result;
+	} else {
+		return len;
+	}
+}
+#endif /* HAVE_LIBZ */
 
 static void
 dispose_chunk( conn_t *conn )

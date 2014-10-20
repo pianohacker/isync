@@ -25,6 +25,10 @@
 
 #include "common.h"
 
+#ifdef HAVE_LIBZ
+#include <zlib.h>
+#endif
+
 #ifdef HAVE_LIBSSL
 typedef struct ssl_st SSL;
 typedef struct ssl_ctx_st SSL_CTX;
@@ -75,6 +79,12 @@ typedef struct {
 #ifdef HAVE_LIBSSL
 	SSL *ssl;
 #endif
+#ifdef HAVE_LIBZ
+	z_streamp in_z;
+	z_streamp out_z;
+	unsigned char *in_z_leftover;
+	int in_z_leftover_len;
+#endif
 
 	void (*bad_callback)( void *aux ); /* async fail while sending or listening */
 	void (*read_callback)( void *aux ); /* data available for reading */
@@ -112,9 +122,16 @@ static INLINE void socket_init( conn_t *conn,
 	conn->fd = -1;
 	conn->name = 0;
 	conn->write_buf_append = &conn->write_buf;
+#ifdef HAVE_LIBZ
+	conn->in_z = NULL;
+	conn->in_z_leftover = NULL;
+	conn->in_z_leftover_len = 0;
+	conn->out_z = NULL;
+#endif
 }
 void socket_connect( conn_t *conn, void (*cb)( int ok, void *aux ) );
 void socket_start_tls(conn_t *conn, void (*cb)( int ok, void *aux ) );
+void socket_start_deflate( conn_t *conn );
 void socket_close( conn_t *sock );
 int socket_read( conn_t *sock, char *buf, int len ); /* never waits */
 char *socket_read_line( conn_t *sock ); /* don't free return value; never waits */
