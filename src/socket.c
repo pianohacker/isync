@@ -300,7 +300,7 @@ void socket_start_deflate( conn_t *conn )
 	conn->in_z->zfree = _socket_zfree;
 	result = inflateInit2(
 		conn->in_z,
-		-8 /* Use raw deflate */
+		-15 /* Use raw deflate */
 	);
 
 	if (result != Z_OK) {
@@ -314,7 +314,7 @@ void socket_start_deflate( conn_t *conn )
 		conn->out_z,
 		Z_DEFAULT_COMPRESSION, /* Compression level */
 		Z_DEFLATED, /* Only valid value */
-		-8, /* Use raw deflate */
+		-15, /* Use raw deflate */
 		8, /* Default memory usage */
 		Z_DEFAULT_STRATEGY /* Don't try to do anything fancy */
 	);
@@ -539,27 +539,27 @@ socket_close( conn_t *sock )
 		sock->ssl = 0;
 	}
 #endif
+#ifdef HAVE_LIBZ
+	if (sock->in_z)
+		inflateEnd( sock->in_z );
+	if (sock->out_z)
+		deflateEnd( sock->out_z );
+	if (sock->out_z_leftover_len)
+		free( sock->out_z_leftover_base );
+#endif
 	while (sock->write_buf)
 		dispose_chunk( sock );
 }
 
-static void
-socket_fill( conn_t *sock )
-{
-	char *buf;
-	int n = sock->offset + sock->bytes;
-	int len = sizeof(sock->buf) - n;
-	if (!len) {
-		error( "Socket error: receive buffer full. Probably protocol error.\n" );
-		socket_fail( sock );
-		return;
-	}
-	assert( sock->fd >= 0 );
-	buf = sock->buf + n;
+static int
+do_read( conn_t *sock, char *buf, int len ) {
+	int n;
+
 #ifdef HAVE_LIBSSL
 	if (sock->ssl) {
 		if ((n = ssl_return( "read from", sock, SSL_read( sock->ssl, buf, len ) )) <= 0)
-			return;
+			return n;
+
 		if (n == len && SSL_pending( sock->ssl ))
 			fake_fd( sock->fd, POLLIN );
 	} else
@@ -568,13 +568,92 @@ socket_fill( conn_t *sock )
 		if ((n = read( sock->fd, buf, len )) < 0) {
 			sys_error( "Socket error: read from %s", sock->name );
 			socket_fail( sock );
-			return;
 		} else if (!n) {
 			error( "Socket error: read from %s: unexpected EOF\n", sock->name );
 			socket_fail( sock );
-			return;
+			return -1;
 		}
 	}
+
+	return n;
+}
+
+static void
+socket_fill( conn_t *sock )
+{
+	char *buf;
+	int n = sock->offset + sock->bytes;
+	int len = sizeof(sock->buf) - n;
+#ifdef HAVE_LIBZ
+	int zn;
+#endif
+	if (!len) {
+		error( "Socket error: receive buffer full. Probably protocol error.\n" );
+		socket_fail( sock );
+		return;
+	}
+	assert( sock->fd >= 0 );
+	buf = sock->buf + n;
+
+#ifdef HAVE_LIBZ
+	if (sock->in_z) {
+		zn = 0;
+		if (sock->in_z_has_leftover) {
+			sock->in_z->avail_out = len;
+			sock->in_z->next_out = (unsigned char*) buf;
+
+			printf("Leftover inflate before: %12p (%7d) into %12p (%7d)\n", sock->in_z->next_in, sock->in_z->avail_in, sock->in_z->next_out, sock->in_z->avail_out);
+			if ( inflate( sock->in_z, Z_SYNC_FLUSH ) != Z_OK ) {
+				error( "Inbound compression error: %s: %s\n", sock->name, sock->in_z->msg );
+				socket_fail( sock );
+				return;
+			}
+			printf("Leftover inflate after:  %12p (%7d) into %12p (%7d)\n", sock->in_z->next_in, sock->in_z->avail_in, sock->in_z->next_out, sock->in_z->avail_out);
+
+			if ( sock->in_z->avail_out == 0 ) {
+				/* Nothing else to do, bookkeeping information already set. */
+				fake_fd( sock->fd, POLLIN );
+				return;
+			} else {
+				sock->in_z_has_leftover = 0;
+				zn += len - sock->in_z->avail_out;
+				buf += zn;
+				len -= zn;
+			}
+		}
+
+		if ((n = do_read( sock, (char*) sock->in_z_buf, sizeof(sock->in_z_buf) )) <= 0) {
+			return;
+		}
+
+		sock->in_z->avail_in = n;
+		sock->in_z->next_in = sock->in_z_buf;
+		sock->in_z->avail_out = len;
+		sock->in_z->next_out = (unsigned char*) buf;
+
+		printf("         Inflate before: %12p (%7d) into %12p (%7d)\n", sock->in_z->next_in, sock->in_z->avail_in, sock->in_z->next_out, sock->in_z->avail_out);
+		if ( inflate( sock->in_z, Z_SYNC_FLUSH ) != Z_OK ) {
+			error( "Inbound compression error: %s: %s\n", sock->name, sock->in_z->msg );
+			socket_fail( sock );
+			return;
+		}
+		printf("         Inflate after:  %12p (%7d) into %12p (%7d)\n", sock->in_z->next_in, sock->in_z->avail_in, sock->in_z->next_out, sock->in_z->avail_out);
+
+		if (sock->in_z->avail_out == 0) {
+			sock->in_z_has_leftover = 1;
+			fake_fd( sock->fd, POLLIN );
+		} else {
+			sock->in_z_has_leftover = 0;
+		}
+
+		zn += len - sock->in_z->avail_out;
+		n = zn;
+	} else
+#endif
+	if ((n = do_read( sock, buf, len ) ) <= 0) {
+		return;
+	}
+
 	sock->bytes += n;
 	sock->read_callback( sock->callback_aux );
 }
@@ -656,20 +735,21 @@ do_write( conn_t *sock, char *buf, int len )
 	int result, to_write;
 	int progress = 0;
 	int outlen;
-	unsigned char *outbuf;
+	unsigned char *outbuf = NULL;
 
 	if (sock->out_z == NULL)
 		return do_write_inner( sock, buf, len );
 
 	/* Make sure that we write out any leftover compression output before we try to output more */
-	if (sock->in_z_leftover_len) {
-		result = do_write_inner( sock, (char*) sock->in_z_leftover, sock->in_z_leftover_len );
+	if (sock->out_z_leftover_len) {
+		result = do_write_inner( sock, (char*) sock->out_z_leftover, sock->out_z_leftover_len );
+		printf("Wrote %7d bytes from %p out of %7d leftover\n", result, sock->out_z_leftover, sock->out_z_leftover_len);
 
 		if (result < 0) {
 			return result;
-		} else if (result < sock->in_z_leftover_len) {
-			sock->in_z_leftover_len -= result;
-			sock->in_z_leftover += result;
+		} else if (result < sock->out_z_leftover_len) {
+			sock->out_z_leftover_len -= result;
+			sock->out_z_leftover += result;
 
 			/*
 			 * Don't return the result of the write; that reflects the amount of _compressed_ output
@@ -677,6 +757,9 @@ do_write( conn_t *sock, char *buf, int len )
 			 */
 			return 0;
 		}
+
+		free( sock->out_z_leftover_base );
+		sock->out_z_leftover_len = 0;
 	}
 
 	sock->out_z->next_in = (unsigned char*) buf;
@@ -691,11 +774,13 @@ do_write( conn_t *sock, char *buf, int len )
 		sock->out_z->next_out = outbuf + progress;
 		sock->out_z->avail_out = outlen - progress;
 
+		printf("Deflate before: %12p (%7d) into %12p (%7d)\n", sock->in_z->next_in, sock->in_z->avail_in, sock->in_z->next_out, sock->in_z->avail_out);
 		if ( deflate( sock->out_z, Z_SYNC_FLUSH ) != Z_OK ) {
 			error( "Outbound compression error: %s: %s\n", sock->name, sock->out_z->msg );
 			socket_fail( sock );
 			return -1;
 		}
+		printf("Deflate after:  %12p (%7d) into %12p (%7d)\n", sock->in_z->next_in, sock->in_z->avail_in, sock->in_z->next_out, sock->in_z->avail_out);
 
 		to_write = outlen - sock->out_z->avail_out;
 		progress = sock->out_z->next_out - outbuf;
@@ -704,12 +789,17 @@ do_write( conn_t *sock, char *buf, int len )
 	} while (sock->out_z->avail_out == 0);
 
 	result = do_write_inner( sock, (char*) outbuf, to_write );
+	printf("Wrote %7d bytes from %p out of %7d\n", result, outbuf, to_write);
 
 	if ( result > 0 && result < to_write ) {
-		sock->in_z_leftover = outbuf + result;
-		sock->in_z_leftover_len = to_write - result;
+		/* Explicitly does not free outbuf; leaves that for next read */
+		sock->out_z_leftover_base = outbuf;
+		sock->out_z_leftover = outbuf + result;
+		sock->out_z_leftover_len = to_write - result;
 
 		return len;
+	} else {
+		sock->out_z_leftover_len = 0;
 	}
 
 	free( outbuf );
