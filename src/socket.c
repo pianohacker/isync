@@ -602,13 +602,11 @@ socket_fill( conn_t *sock )
 			sock->in_z->avail_out = len;
 			sock->in_z->next_out = (unsigned char*) buf;
 
-			printf("Leftover inflate before: %12p (%7d) into %12p (%7d)\n", sock->in_z->next_in, sock->in_z->avail_in, sock->in_z->next_out, sock->in_z->avail_out);
 			if ( inflate( sock->in_z, Z_SYNC_FLUSH ) != Z_OK ) {
 				error( "Inbound compression error: %s: %s\n", sock->name, sock->in_z->msg );
 				socket_fail( sock );
 				return;
 			}
-			printf("Leftover inflate after:  %12p (%7d) into %12p (%7d)\n", sock->in_z->next_in, sock->in_z->avail_in, sock->in_z->next_out, sock->in_z->avail_out);
 
 			if ( sock->in_z->avail_out == 0 ) {
 				/* Nothing else to do, bookkeeping information already set. */
@@ -631,13 +629,11 @@ socket_fill( conn_t *sock )
 		sock->in_z->avail_out = len;
 		sock->in_z->next_out = (unsigned char*) buf;
 
-		printf("         Inflate before: %12p (%7d) into %12p (%7d)\n", sock->in_z->next_in, sock->in_z->avail_in, sock->in_z->next_out, sock->in_z->avail_out);
 		if ( inflate( sock->in_z, Z_SYNC_FLUSH ) != Z_OK ) {
 			error( "Inbound compression error: %s: %s\n", sock->name, sock->in_z->msg );
 			socket_fail( sock );
 			return;
 		}
-		printf("         Inflate after:  %12p (%7d) into %12p (%7d)\n", sock->in_z->next_in, sock->in_z->avail_in, sock->in_z->next_out, sock->in_z->avail_out);
 
 		if (sock->in_z->avail_out == 0) {
 			sock->in_z_has_leftover = 1;
@@ -743,7 +739,6 @@ do_write( conn_t *sock, char *buf, int len )
 	/* Make sure that we write out any leftover compression output before we try to output more */
 	if (sock->out_z_leftover_len) {
 		result = do_write_inner( sock, (char*) sock->out_z_leftover, sock->out_z_leftover_len );
-		printf("Wrote %7d bytes from %p out of %7d leftover\n", result, sock->out_z_leftover, sock->out_z_leftover_len);
 
 		if (result < 0) {
 			return result;
@@ -774,13 +769,11 @@ do_write( conn_t *sock, char *buf, int len )
 		sock->out_z->next_out = outbuf + progress;
 		sock->out_z->avail_out = outlen - progress;
 
-		printf("Deflate before: %12p (%7d) into %12p (%7d)\n", sock->in_z->next_in, sock->in_z->avail_in, sock->in_z->next_out, sock->in_z->avail_out);
 		if ( deflate( sock->out_z, Z_SYNC_FLUSH ) != Z_OK ) {
 			error( "Outbound compression error: %s: %s\n", sock->name, sock->out_z->msg );
 			socket_fail( sock );
 			return -1;
 		}
-		printf("Deflate after:  %12p (%7d) into %12p (%7d)\n", sock->in_z->next_in, sock->in_z->avail_in, sock->in_z->next_out, sock->in_z->avail_out);
 
 		to_write = outlen - sock->out_z->avail_out;
 		progress = sock->out_z->next_out - outbuf;
@@ -789,9 +782,8 @@ do_write( conn_t *sock, char *buf, int len )
 	} while (sock->out_z->avail_out == 0);
 
 	result = do_write_inner( sock, (char*) outbuf, to_write );
-	printf("Wrote %7d bytes from %p out of %7d\n", result, outbuf, to_write);
 
-	if ( result > 0 && result < to_write ) {
+	if ( result >= 0 && result < to_write ) {
 		/* Explicitly does not free outbuf; leaves that for next read */
 		sock->out_z_leftover_base = outbuf;
 		sock->out_z_leftover = outbuf + result;
